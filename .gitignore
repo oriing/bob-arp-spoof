@@ -1,0 +1,3 @@
+*.o
+send-arp.pro.user
+.qmake.stash
