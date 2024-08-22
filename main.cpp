@@ -286,7 +286,7 @@ void searchNetwork(pcap_t* handle) {
 
         fclose(fp);
         for(uint32_t i=sizeof(EthHdr); i<(header->len); i+= 1500-sizeof(EthHdr)){
-            sendPacket(*packetPtr, data, i, max(header->len, (uint32_t)(i+1500-sizeof(EthHdr))));
+            sendPacket(*packetPtr, data, i, min(header->len, (uint32_t)(i+1500-sizeof(EthHdr))));
         }
     }
 }
